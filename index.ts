@@ -90,6 +90,16 @@ interface AskToolDetails {
 
 type AskUIResult = AskResponse;
 
+interface PendingCall {
+   options: QuestionOption[];
+   allowMultiple: boolean;
+   allowFreeform: boolean;
+   resolve: (result: AskUIResult | null) => void;
+}
+
+const pendingCalls = new Map<string, PendingCall>();
+const registeredExternalResponseBuses = new WeakSet<object>();
+
 function normalizeOptions(options: AskOptionInput[]): QuestionOption[] {
    return options
       .map((option) => {
@@ -131,6 +141,40 @@ function createSelectionResponse(selections: string[], comment?: string | null):
    return normalizedComment
       ? { kind: "selection", selections: normalizedSelections, comment: normalizedComment }
       : { kind: "selection", selections: normalizedSelections };
+}
+
+function canonicalizeExternalResponse(
+   pending: PendingCall,
+   rawResponse: unknown,
+): AskUIResult | null | undefined {
+   if (rawResponse === null) return null;
+   if (!rawResponse || typeof rawResponse !== "object") return undefined;
+
+   const response = rawResponse as Record<string, unknown>;
+
+   if (response.kind === "selection") {
+      if (!Array.isArray(response.selections) || response.selections.length === 0) return undefined;
+      if (response.selections.some((selection) => typeof selection !== "string")) return undefined;
+
+      const normalizedSelections = response.selections.map((selection) => selection.trim()).filter(Boolean);
+      if (normalizedSelections.length === 0) return undefined;
+      if (!pending.allowMultiple && normalizedSelections.length > 1) return undefined;
+
+      const optionTitles = new Set(pending.options.map((option) => option.title));
+      if (!normalizedSelections.every((selection) => optionTitles.has(selection))) return undefined;
+
+      const comment = response.comment;
+      if (!(typeof comment === "string" || comment === null || comment === undefined)) return undefined;
+
+      return createSelectionResponse(normalizedSelections, comment) ?? undefined;
+   }
+
+   if (response.kind === "freeform") {
+      if (!pending.allowFreeform || typeof response.text !== "string") return undefined;
+      return createFreeformResponse(response.text) ?? undefined;
+   }
+
+   return undefined;
 }
 
 function formatResponseSummary(response: AskResponse): string {
@@ -1449,7 +1493,37 @@ async function askViaDialogs(
    return createSelectionResponse([selected], comment);
 }
 
+function ensureExternalResponseHandlerRegistered(pi: ExtensionAPI) {
+   const events = pi.events as (ExtensionAPI["events"] & {
+      on?: (name: string, handler: (data: unknown) => void) => (() => void) | void;
+   }) | undefined;
+
+   if (!events || typeof events !== "object" || typeof events.on !== "function") return;
+   if (registeredExternalResponseBuses.has(events)) return;
+
+   registeredExternalResponseBuses.add(events);
+   events.on("ask_user:external_response", (data: unknown) => {
+      if (!data || typeof data !== "object") return;
+
+      const payload = data as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(payload, "response")) return;
+
+      const toolCallId = payload.toolCallId;
+      if (typeof toolCallId !== "string") return;
+
+      const pending = pendingCalls.get(toolCallId);
+      if (!pending) return;
+
+      const canonicalResponse = canonicalizeExternalResponse(pending, payload.response);
+      if (canonicalResponse === undefined) return;
+
+      pending.resolve(canonicalResponse);
+   });
+}
+
 export default function(pi: ExtensionAPI) {
+   ensureExternalResponseHandlerRegistered(pi);
+
    pi.registerTool({
       name: "ask_user",
       label: "Ask User",
@@ -1515,7 +1589,7 @@ export default function(pi: ExtensionAPI) {
          ),
       }),
 
-      async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
          if (signal?.aborted) {
             return {
                content: [{ type: "text", text: "Cancelled" }],
@@ -1601,13 +1675,27 @@ export default function(pi: ExtensionAPI) {
          let hasAnnouncedHide = false;
          try {
             const customFactory = (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (result: AskUIResult | null) => void) => {
+               let settled = false;
+               const onceDone = (nextResult: AskUIResult | null) => {
+                  if (settled) return;
+                  settled = true;
+                  done(nextResult);
+               };
+
+               pendingCalls.set(toolCallId, {
+                  options,
+                  allowMultiple,
+                  allowFreeform,
+                  resolve: onceDone,
+               });
+
                if (signal) {
-                  const onAbort = () => done(null);
+                  const onAbort = () => onceDone(null);
                   signal.addEventListener("abort", onAbort, { once: true });
                }
 
                if (timeout && timeout > 0) {
-                  setTimeout(() => done(null), timeout);
+                  setTimeout(() => onceDone(null), timeout);
                }
 
                return new AskComponent(
@@ -1622,7 +1710,7 @@ export default function(pi: ExtensionAPI) {
                   theme,
                   keybindings,
                   shortcuts,
-                  done,
+                  onceDone,
                );
             };
 
@@ -1648,12 +1736,17 @@ export default function(pi: ExtensionAPI) {
                });
             }
 
-            const customResult = await ctx.ui.custom<AskUIResult | null>(
-               customFactory,
-               buildCustomUIOptions(effectiveDisplayMode, (handle) => {
-                  overlayHandle = handle;
-               }),
-            );
+            let customResult: AskUIResult | null | undefined;
+            try {
+               customResult = await ctx.ui.custom<AskUIResult | null>(
+                  customFactory,
+                  buildCustomUIOptions(effectiveDisplayMode, (handle) => {
+                     overlayHandle = handle;
+                  }),
+               );
+            } finally {
+               pendingCalls.delete(toolCallId);
+            }
 
             if (customResult !== undefined) {
                result = customResult;

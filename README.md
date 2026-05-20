@@ -151,6 +151,78 @@ interface AskToolDetails {
 }
 ```
 
+## External responses from another extension
+
+Another extension can answer or cancel a live `ask_user` prompt by emitting an event on `pi.events`:
+
+- Event name: `ask_user:external_response`
+- Scope: **only** a currently pending `ask_user` call that is still waiting inside `ctx.ui.custom(...)`
+
+### Event payload
+
+```typescript
+type ExternalAskUserResponseEvent = {
+  toolCallId: string;
+  response:
+    | { kind: "selection"; selections: string[]; comment?: string | null }
+    | { kind: "freeform"; text: string }
+    | null;
+};
+```
+
+Example selection response:
+
+```typescript
+pi.events.emit("ask_user:external_response", {
+  toolCallId: "tool-call-id",
+  response: {
+    kind: "selection",
+    selections: ["production"],
+    comment: "Ship after support signs off."
+  }
+});
+```
+
+Example freeform response:
+
+```typescript
+pi.events.emit("ask_user:external_response", {
+  toolCallId: "tool-call-id",
+  response: {
+    kind: "freeform",
+    text: "Use the blue/green path for this rollout"
+  }
+});
+```
+
+Example explicit cancel:
+
+```typescript
+pi.events.emit("ask_user:external_response", {
+  toolCallId: "tool-call-id",
+  response: null
+});
+```
+
+### Semantics
+
+- `response: null` is an explicit external cancel.
+- A missing `response` property is ignored.
+- Selection titles must exactly match the live option titles after trimming.
+- Freeform responses are accepted only when the live call has `allowFreeform: true`.
+- Selection `comment` is trimmed and passed through even when `allowComment: false` because `allowComment` only controls the local TUI.
+- Valid external payloads are canonicalized into the same `details.response` shape used by local answers.
+- The event handler does **not** emit `ask:answered` or `ask:cancelled` directly; it only resolves the live prompt, and the normal result path emits those events once.
+
+### Scope limit
+
+External responses are ignored for:
+
+- non-interactive `!ctx.hasUI` execution
+- zero-option calls that go straight to `ctx.ui.input(...)`
+- RPC/dialog fallback after `ctx.ui.custom()` has already returned `undefined`
+- stale or late `toolCallId` values after the live custom UI has already settled
+
 ## Changelog
 
 See [CHANGELOG.md](./CHANGELOG.md).

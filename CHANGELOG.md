@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- External `ask_user` resolution via `pi.events.emit("ask_user:external_response", ...)`, allowing another extension to answer or cancel a live `ask_user` prompt while `ctx.ui.custom()` is still pending. Payloads are canonicalized to the same response shapes as local answers; `response: null` cancels explicitly, while missing/invalid/stale payloads are ignored.
+
 ## [0.11.0](https://github.com/edlsh/pi-ask-user/releases/tag/v0.11.0) - 2026-05-09
 
 ### Added
