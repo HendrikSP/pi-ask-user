@@ -160,6 +160,41 @@ type RegisteredTool = {
    renderResult: (result: any, options: any, theme: any) => any;
 };
 
+type TestEventHandler = (payload: any) => void;
+
+type TestEvents = {
+   emit: (name: string, payload: any) => void;
+   on: (name: string, handler: TestEventHandler) => () => void;
+   getHandlerCount: (name: string) => number;
+};
+
+function createTestEvents(): TestEvents {
+   const handlers = new Map<string, TestEventHandler[]>();
+
+   return {
+      emit(name: string, payload: any) {
+         emittedEvents.push({ name, payload });
+         for (const handler of handlers.get(name) ?? []) {
+            handler(payload);
+         }
+      },
+      on(name: string, handler: TestEventHandler) {
+         handlers.set(name, [...(handlers.get(name) ?? []), handler]);
+         return () => {
+            const remaining = (handlers.get(name) ?? []).filter((candidate) => candidate !== handler);
+            if (remaining.length > 0) {
+               handlers.set(name, remaining);
+            } else {
+               handlers.delete(name);
+            }
+         };
+      },
+      getHandlerCount(name: string) {
+         return handlers.get(name)?.length ?? 0;
+      },
+   };
+}
+
 function stubEnv(key: string, value: string): void {
    const original = process.env[key];
    process.env[key] = value;
@@ -172,7 +207,11 @@ function stubEnv(key: string, value: string): void {
    });
 }
 
-async function setupTool(): Promise<RegisteredTool> {
+async function setupExtension(events: TestEvents = createTestEvents()): Promise<{
+   tool: RegisteredTool;
+   events: TestEvents;
+   pi: any;
+}> {
    const { default: askUserExtension } = await import("./index");
    let registeredTool: RegisteredTool | undefined;
    emittedEvents = [];
@@ -180,11 +219,7 @@ async function setupTool(): Promise<RegisteredTool> {
       registerTool(tool: RegisteredTool) {
          registeredTool = tool;
       },
-      events: {
-         emit(name: string, payload: any) {
-            emittedEvents.push({ name, payload });
-         },
-      },
+      events,
    } as any;
 
    askUserExtension(pi);
@@ -193,13 +228,34 @@ async function setupTool(): Promise<RegisteredTool> {
       throw new Error("Tool was not registered");
    }
 
-   return registeredTool;
+   return { tool: registeredTool, events, pi };
+}
+
+async function setupTool(): Promise<RegisteredTool> {
+   return (await setupExtension()).tool;
 }
 
 function createTheme() {
    return {
       fg: (_color: string, text: string) => text,
       bold: (text: string) => text,
+   };
+}
+
+function createDeferred<T>() {
+   let resolve!: (value: T | PromiseLike<T>) => void;
+   let reject!: (reason?: unknown) => void;
+   const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+   });
+   return { promise, resolve, reject };
+}
+
+function createTestTui() {
+   return {
+      requestRender() { },
+      terminal: { rows: 24 },
    };
 }
 
@@ -405,6 +461,719 @@ describe("ask_user", () => {
       );
 
       expect(capturedOptions.overlay).toBe(true);
+   });
+
+   describe("external response handler", () => {
+      test("registers the inbound handler once per event bus", async () => {
+         const sharedEvents = createTestEvents();
+
+         await setupExtension(sharedEvents);
+         expect(sharedEvents.getHandlerCount("ask_user:external_response")).toBe(1);
+
+         await setupExtension(sharedEvents);
+         expect(sharedEvents.getHandlerCount("ask_user:external_response")).toBe(1);
+
+         const freshEvents = createTestEvents();
+         await setupExtension(freshEvents);
+         expect(freshEvents.getHandlerCount("ask_user:external_response")).toBe(1);
+      });
+
+      test("external response resolves a live pending call", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(
+                           { requestRender() { }, terminal: { rows: 24 } },
+                           createTheme(),
+                           createKeybindings(),
+                           resolve,
+                        );
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "tool-call-id",
+                              response: { kind: "selection", selections: ["A"] },
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "selection", selections: ["A"] });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("external response null cancels a live pending call", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(
+                           { requestRender() { }, terminal: { rows: 24 } },
+                           createTheme(),
+                           createKeybindings(),
+                           resolve,
+                        );
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "tool-call-id",
+                              response: null,
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(true);
+         expect(result.details.response).toBeNull();
+         expect(emittedEvents.filter((event) => event.name === "ask:cancelled")).toHaveLength(1);
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(0);
+      });
+
+      test("late external responses are ignored after the live custom UI settles", async () => {
+         const { tool, events } = await setupExtension();
+
+         const result = await tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async () => ({ kind: "selection", selections: ["B"] }),
+               },
+            },
+         );
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "selection", selections: ["B"] });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+         expect(emittedEvents.filter((event) => event.name === "ask:cancelled")).toHaveLength(0);
+
+         events.emit("ask_user:external_response", {
+            toolCallId: "tool-call-id",
+            response: { kind: "selection", selections: ["A"] },
+         });
+
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+         expect(emittedEvents.filter((event) => event.name === "ask:cancelled")).toHaveLength(0);
+      });
+
+      test("external freeform response resolves a live pending call when allowFreeform is enabled", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+               allowFreeform: true,
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "tool-call-id",
+                              response: { kind: "freeform", text: "  Custom direction  " },
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "freeform", text: "Custom direction" });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("stale toolCallId is ignored", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "live-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "stale-call-id",
+                              response: { kind: "selection", selections: ["A"] },
+                           });
+                           queueMicrotask(() => {
+                              events.emit("ask_user:external_response", {
+                                 toolCallId: "live-call-id",
+                                 response: { kind: "selection", selections: ["B"] },
+                              });
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "selection", selections: ["B"] });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("invalid external payloads are ignored", async () => {
+         const { tool, events } = await setupExtension();
+
+         const invalidPayloads = [
+            { toolCallId: "tool-call-id" },
+            { toolCallId: "tool-call-id", response: { kind: "selection", selections: ["A", "B"] } },
+            { toolCallId: "tool-call-id", response: { kind: "selection", selections: ["Missing"] } },
+            { toolCallId: "tool-call-id", response: { kind: "freeform", text: "Not allowed" } },
+            { toolCallId: "tool-call-id", response: { kind: "mystery", text: "???" } },
+            { toolCallId: "tool-call-id", response: { kind: "freeform", text: "   " } },
+            { toolCallId: "tool-call-id", response: { kind: "selection", selections: ["A"], comment: 123 } },
+         ];
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+               allowFreeform: false,
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+
+                        queueMicrotask(() => {
+                           for (const payload of invalidPayloads) {
+                              events.emit("ask_user:external_response", payload);
+                           }
+                           queueMicrotask(() => {
+                              events.emit("ask_user:external_response", {
+                                 toolCallId: "tool-call-id",
+                                 response: { kind: "selection", selections: ["B"] },
+                              });
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "selection", selections: ["B"] });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("comment is normalized and passed through even when allowComment is false", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+               allowComment: false,
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "tool-call-id",
+                              response: {
+                                 kind: "selection",
+                                 selections: ["A"],
+                                 comment: "  Keep rollout behind the current flag.  ",
+                              },
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({
+            kind: "selection",
+            selections: ["A"],
+            comment: "Keep rollout behind the current flag.",
+         });
+      });
+
+      test("local UI resolution wins over a late external response", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        const component = factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+                        component.handleInput("down");
+                        component.handleInput("enter");
+
+                        setTimeout(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "tool-call-id",
+                              response: { kind: "selection", selections: ["A"] },
+                           });
+                        }, 0);
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+         await new Promise((resolve) => setTimeout(resolve, 0));
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "selection", selections: ["B"] });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("external response wins over a slower local UI interaction", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        const component = factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+
+                        setTimeout(() => {
+                           component.handleInput("down");
+                           component.handleInput("enter");
+                        }, 10);
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "tool-call-id",
+                              response: { kind: "selection", selections: ["A"] },
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+         await new Promise((resolve) => setTimeout(resolve, 15));
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "selection", selections: ["A"] });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("abort still works unchanged", async () => {
+         const { tool } = await setupExtension();
+         const controller = new AbortController();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            controller.signal,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+                        queueMicrotask(() => controller.abort());
+                     }),
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(true);
+         expect(result.details.response).toBeNull();
+         expect(emittedEvents.filter((event) => event.name === "ask:cancelled")).toHaveLength(1);
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(0);
+      });
+
+      test("timeout still works unchanged", async () => {
+         const { tool } = await setupExtension();
+
+         const result = await tool.execute(
+            "tool-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+               timeout: 5,
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+                     }),
+               },
+            },
+         );
+
+         expect(result.details.cancelled).toBe(true);
+         expect(result.details.response).toBeNull();
+         expect(emittedEvents.filter((event) => event.name === "ask:cancelled")).toHaveLength(1);
+      });
+
+      test("dialog fallback is not externally resolvable", async () => {
+         const { tool, events } = await setupExtension();
+         const selectResult = createDeferred<string | undefined>();
+
+         const resultPromise = tool.execute(
+            "tool-call-id",
+            {
+               question: "Pick a color",
+               options: ["Red", "Blue"],
+               allowFreeform: false,
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async () => undefined,
+                  select: async () => await selectResult.promise,
+                  input: async () => undefined,
+               },
+            },
+         );
+
+         queueMicrotask(() => {
+            events.emit("ask_user:external_response", {
+               toolCallId: "tool-call-id",
+               response: { kind: "selection", selections: ["Red"] },
+            });
+            queueMicrotask(() => selectResult.resolve("Blue"));
+         });
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "selection", selections: ["Blue"] });
+      });
+
+      test("non-interactive path remains unaffected", async () => {
+         const { tool, events } = await setupExtension();
+
+         const nonInteractiveResult = await tool.execute(
+            "no-ui-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: false,
+            },
+         );
+
+         events.emit("ask_user:external_response", {
+            toolCallId: "no-ui-call-id",
+            response: { kind: "selection", selections: ["A"] },
+         });
+
+         expect(nonInteractiveResult.isError).toBe(true);
+         expect(nonInteractiveResult.details.cancelled).toBe(true);
+         expect(nonInteractiveResult.details.response).toBeNull();
+      });
+
+      test("zero-option custom freeform path closes on external responses", async () => {
+         const { tool, events } = await setupExtension();
+         let inputCalled = false;
+
+         const resultPromise = tool.execute(
+            "zero-option-call-id",
+            {
+               question: "Tell me more",
+               options: [],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "zero-option-call-id",
+                              response: { kind: "freeform", text: "  Need more telemetry.  " },
+                           });
+                        });
+                     }),
+                  input: async () => {
+                     inputCalled = true;
+                     return "  Late local answer  ";
+                  },
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         expect(inputCalled).toBe(false);
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "freeform", text: "Need more telemetry." });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("zero-option input fallback accepts external responses", async () => {
+         const { tool, events } = await setupExtension();
+         const inputResult = createDeferred<string | undefined>();
+
+         const resultPromise = tool.execute(
+            "zero-option-call-id",
+            {
+               question: "Tell me more",
+               options: [],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  input: async () => await inputResult.promise,
+               },
+            },
+         );
+
+         queueMicrotask(() => {
+            events.emit("ask_user:external_response", {
+               toolCallId: "zero-option-call-id",
+               response: { kind: "freeform", text: "  Need more telemetry.  " },
+            });
+            queueMicrotask(() => inputResult.resolve("  Late local answer  "));
+         });
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "freeform", text: "Need more telemetry." });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("invalid zero-option external selections are ignored", async () => {
+         const { tool, events } = await setupExtension();
+         const inputResult = createDeferred<string | undefined>();
+
+         const resultPromise = tool.execute(
+            "zero-option-call-id",
+            {
+               question: "Tell me more",
+               options: [],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  input: async () => await inputResult.promise,
+               },
+            },
+         );
+
+         queueMicrotask(() => {
+            events.emit("ask_user:external_response", {
+               toolCallId: "zero-option-call-id",
+               response: { kind: "selection", selections: ["A"] },
+            });
+            queueMicrotask(() => inputResult.resolve("  Need more telemetry.  "));
+         });
+
+         const result = await resultPromise;
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "freeform", text: "Need more telemetry." });
+      });
+
+      test("zero-option local input wins over a late external response", async () => {
+         const { tool, events } = await setupExtension();
+
+         const resultPromise = tool.execute(
+            "zero-option-call-id",
+            {
+               question: "Tell me more",
+               options: [],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  input: async () => "  Local answer  ",
+               },
+            },
+         );
+
+         const result = await resultPromise;
+
+         events.emit("ask_user:external_response", {
+            toolCallId: "zero-option-call-id",
+            response: { kind: "freeform", text: "Late external answer" },
+         });
+
+         expect(result.details.cancelled).toBe(false);
+         expect(result.details.response).toEqual({ kind: "freeform", text: "Local answer" });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(1);
+      });
+
+      test("completed calls do not leave pending-call entries behind", async () => {
+         const { tool, events } = await setupExtension();
+
+         const firstResult = await tool.execute(
+            "completed-call-id",
+            {
+               question: "Which option should we use?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async () => ({ kind: "selection", selections: ["A"] }),
+               },
+            },
+         );
+
+         expect(firstResult.details.response).toEqual({ kind: "selection", selections: ["A"] });
+
+         const secondResultPromise = tool.execute(
+            "live-call-id",
+            {
+               question: "Which option should we use now?",
+               options: ["A", "B"],
+            },
+            undefined,
+            undefined,
+            {
+               hasUI: true,
+               ui: {
+                  custom: async (factory: any) =>
+                     await new Promise((resolve) => {
+                        factory(createTestTui(), createTheme(), createKeybindings(), resolve);
+
+                        queueMicrotask(() => {
+                           events.emit("ask_user:external_response", {
+                              toolCallId: "completed-call-id",
+                              response: { kind: "selection", selections: ["B"] },
+                           });
+                           queueMicrotask(() => {
+                              events.emit("ask_user:external_response", {
+                                 toolCallId: "live-call-id",
+                                 response: { kind: "selection", selections: ["B"] },
+                              });
+                           });
+                        });
+                     }),
+               },
+            },
+         );
+
+         const secondResult = await secondResultPromise;
+
+         expect(secondResult.details.cancelled).toBe(false);
+         expect(secondResult.details.response).toEqual({ kind: "selection", selections: ["B"] });
+         expect(emittedEvents.filter((event) => event.name === "ask:answered")).toHaveLength(2);
+      });
    });
 
    describe("overlay hide/show toggle (alt+o)", () => {

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- External `ask_user:external_response` support for resolving or cancelling a live `ask_user` prompt from another extension while `ctx.ui.custom(...)` is still pending, now including zero-option prompts that are waiting on `ctx.ui.input(...)`. Invalid, stale, and out-of-scope payloads are ignored; valid payloads flow through the normal result path and emit the usual `ask:answered` / `ask:cancelled` events once.
+
 ## [0.11.1](https://github.com/edlsh/pi-ask-user/releases/tag/v0.11.1) - 2026-05-23
 
 ### Fixed

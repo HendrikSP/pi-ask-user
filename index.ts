@@ -120,6 +120,75 @@ interface AskToolDetails {
 
 type AskUIResult = AskResponse;
 
+interface PendingCall {
+   options: QuestionOption[];
+   allowMultiple: boolean;
+   allowFreeform: boolean;
+   resolve: (result: AskUIResult | null) => void;
+}
+
+const pendingCalls = new Map<string, PendingCall>();
+const registeredExternalResponseBuses = new WeakSet<object>();
+
+function createPendingCallResolver(
+   toolCallId: string,
+   options: QuestionOption[],
+   allowMultiple: boolean,
+   allowFreeform: boolean,
+   settle: (result: AskUIResult | null) => void,
+   signal?: AbortSignal,
+   timeout?: number,
+): {
+   onceDone: (result: AskUIResult | null) => void;
+   isSettled: () => boolean;
+   cleanup: () => void;
+} {
+   let settled = false;
+   let timeoutId: ReturnType<typeof setTimeout> | undefined;
+   let removeAbortListener: (() => void) | undefined;
+
+   const cleanup = () => {
+      pendingCalls.delete(toolCallId);
+      if (timeoutId !== undefined) {
+         clearTimeout(timeoutId);
+         timeoutId = undefined;
+      }
+      removeAbortListener?.();
+      removeAbortListener = undefined;
+   };
+
+   const onceDone = (result: AskUIResult | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      settle(result);
+   };
+
+   pendingCalls.set(toolCallId, {
+      options,
+      allowMultiple,
+      allowFreeform,
+      resolve: onceDone,
+   });
+
+   if (signal) {
+      if (signal.aborted) {
+         onceDone(null);
+         return { onceDone, isSettled: () => settled, cleanup };
+      }
+
+      const onAbort = () => onceDone(null);
+      signal.addEventListener("abort", onAbort, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", onAbort);
+   }
+
+   if (timeout && timeout > 0) {
+      timeoutId = setTimeout(() => onceDone(null), timeout);
+   }
+
+   return { onceDone, isSettled: () => settled, cleanup };
+}
+
 function normalizeOptions(options: AskOptionInput[]): QuestionOption[] {
    return options
       .map((option) => {
@@ -161,6 +230,40 @@ function createSelectionResponse(selections: string[], comment?: string | null):
    return normalizedComment
       ? { kind: "selection", selections: normalizedSelections, comment: normalizedComment }
       : { kind: "selection", selections: normalizedSelections };
+}
+
+function canonicalizeExternalResponse(
+   pending: PendingCall,
+   rawResponse: unknown,
+): AskUIResult | null | undefined {
+   if (rawResponse === null) return null;
+   if (!rawResponse || typeof rawResponse !== "object") return undefined;
+
+   const response = rawResponse as Record<string, unknown>;
+
+   if (response.kind === "selection") {
+      if (!Array.isArray(response.selections) || response.selections.length === 0) return undefined;
+      if (response.selections.some((selection) => typeof selection !== "string")) return undefined;
+
+      const normalizedSelections = response.selections.map((selection) => selection.trim()).filter(Boolean);
+      if (normalizedSelections.length === 0) return undefined;
+      if (!pending.allowMultiple && normalizedSelections.length > 1) return undefined;
+
+      const optionTitles = new Set(pending.options.map((option) => option.title));
+      if (!normalizedSelections.every((selection) => optionTitles.has(selection))) return undefined;
+
+      const comment = response.comment;
+      if (!(typeof comment === "string" || comment === null || comment === undefined)) return undefined;
+
+      return createSelectionResponse(normalizedSelections, comment) ?? undefined;
+   }
+
+   if (response.kind === "freeform") {
+      if (!pending.allowFreeform || typeof response.text !== "string") return undefined;
+      return createFreeformResponse(response.text) ?? undefined;
+   }
+
+   return undefined;
 }
 
 function formatResponseSummary(response: AskResponse): string {
@@ -1036,6 +1139,7 @@ class AskComponent extends Container {
       keybindings: KeybindingsManager,
       shortcuts: ResolvedAskShortcuts,
       onDone: (result: AskUIResult | null) => void,
+      initialMode: AskMode = "select",
    ) {
       super();
 
@@ -1095,7 +1199,11 @@ class AskComponent extends Container {
       ));
 
       this.updateStaticText();
-      this.showSelectMode();
+      if (initialMode === "freeform") {
+         this.showFreeformMode();
+      } else {
+         this.showSelectMode();
+      }
    }
 
    override invalidate(): void {
@@ -1176,10 +1284,11 @@ class AskComponent extends Container {
          const alternateCancelKeys = this.keybindings
             .getKeys("tui.select.cancel")
             .filter((key) => key !== "escape" && key !== "esc");
+         const canReturnToSelection = this.mode === "comment" || this.options.length > 0;
          const hints = [
             keybindingHint(theme, this.keybindings, "tui.input.submit", this.mode === "comment" ? "submit/skip" : "submit"),
             keybindingHint(theme, this.keybindings, "tui.input.newLine", "newline"),
-            literalHint(theme, "esc", "back"),
+            literalHint(theme, "esc", canReturnToSelection ? "back" : "cancel"),
             overlayHint,
             alternateCancelKeys.length > 0 ? literalHint(theme, formatKeyList(alternateCancelKeys), "cancel") : null,
          ]
@@ -1383,7 +1492,11 @@ class AskComponent extends Container {
    handleInput(data: string): void {
       if (this.mode === "freeform" || this.mode === "comment") {
          if (matchesKey(data, Key.escape)) {
-            this.showSelectMode();
+            if (this.mode === "comment" || this.options.length > 0) {
+               this.showSelectMode();
+            } else {
+               this.onDone(null);
+            }
             return;
          }
 
@@ -1473,7 +1586,37 @@ async function askViaDialogs(
    return createSelectionResponse([selected], comment);
 }
 
+function ensureExternalResponseHandlerRegistered(pi: ExtensionAPI) {
+   const events = pi.events as (ExtensionAPI["events"] & {
+      on?: (name: string, handler: (data: unknown) => void) => (() => void) | void;
+   }) | undefined;
+
+   if (!events || typeof events !== "object" || typeof events.on !== "function") return;
+   if (registeredExternalResponseBuses.has(events)) return;
+
+   registeredExternalResponseBuses.add(events);
+   events.on("ask_user:external_response", (data: unknown) => {
+      if (!data || typeof data !== "object") return;
+
+      const payload = data as Record<string, unknown>;
+      if (!Object.prototype.hasOwnProperty.call(payload, "response")) return;
+
+      const toolCallId = payload.toolCallId;
+      if (typeof toolCallId !== "string") return;
+
+      const pending = pendingCalls.get(toolCallId);
+      if (!pending) return;
+
+      const canonicalResponse = canonicalizeExternalResponse(pending, payload.response);
+      if (canonicalResponse === undefined) return;
+
+      pending.resolve(canonicalResponse);
+   });
+}
+
 export default function(pi: ExtensionAPI) {
+   ensureExternalResponseHandlerRegistered(pi);
+
    pi.registerTool({
       name: "ask_user",
       label: "Ask User",
@@ -1539,7 +1682,7 @@ export default function(pi: ExtensionAPI) {
          ),
       }),
 
-      async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      async execute(toolCallId, params, signal, onUpdate, ctx) {
          if (signal?.aborted) {
             return {
                content: [{ type: "text", text: "Cancelled" }],
@@ -1597,10 +1740,122 @@ export default function(pi: ExtensionAPI) {
 
          if (options.length === 0) {
             const prompt = normalizedContext ? `${question}\n\nContext:\n${normalizedContext}` : question;
-            const answer = await ctx.ui.input(prompt, "Type your answer...", timeout ? { timeout } : undefined);
-            const response = createFreeformResponse(answer);
+            onUpdate?.({
+               content: [{ type: "text", text: "Waiting for user input..." }],
+               details: { question, context: normalizedContext, options, response: null, cancelled: false },
+            });
+
+            let response: AskUIResult | null | undefined;
+            let overlayHandle: OverlayHandle | undefined;
+            let removeOverlayInputListener: (() => void) | undefined;
+            let cleanupPendingCustomCall: (() => void) | undefined;
+            let hasAnnouncedHide = false;
+            try {
+               if (typeof ctx.ui.custom === "function") {
+                  const overlayToggle = shortcuts.overlayToggle;
+                  if (
+                     effectiveDisplayMode === "overlay"
+                     && !overlayToggle.disabled
+                     && typeof ctx.ui.onTerminalInput === "function"
+                  ) {
+                     removeOverlayInputListener = ctx.ui.onTerminalInput((data) => {
+                        if (!overlayToggle.matches(data) || !overlayHandle) return undefined;
+                        const nextHidden = !overlayHandle.isHidden();
+                        overlayHandle.setHidden(nextHidden);
+                        if (nextHidden && !hasAnnouncedHide) {
+                           hasAnnouncedHide = true;
+                           ctx.ui.notify?.(`ask_user hidden — press ${overlayToggle.spec} to reopen`, "info");
+                        }
+                        return { consume: true };
+                     });
+                  }
+
+                  let customResult: AskUIResult | null | undefined;
+                  try {
+                     customResult = await ctx.ui.custom<AskUIResult | null>(
+                        (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (result: AskUIResult | null) => void) => {
+                           const { onceDone, cleanup } = createPendingCallResolver(
+                              toolCallId,
+                              options,
+                              false,
+                              true,
+                              done,
+                              signal,
+                              timeout,
+                           );
+                           cleanupPendingCustomCall = cleanup;
+
+                           return new AskComponent(
+                              question,
+                              normalizedContext,
+                              options,
+                              false,
+                              true,
+                              false,
+                              effectiveDisplayMode,
+                              tui,
+                              theme,
+                              keybindings,
+                              shortcuts,
+                              onceDone,
+                              "freeform",
+                           );
+                        },
+                        buildCustomUIOptions(effectiveDisplayMode, (handle) => {
+                           overlayHandle = handle;
+                        }),
+                     );
+                  } finally {
+                     cleanupPendingCustomCall?.();
+                     cleanupPendingCustomCall = undefined;
+                  }
+
+                  if (customResult !== undefined) {
+                     response = customResult;
+                  }
+               }
+
+               if (response === undefined) {
+                  response = await new Promise<AskUIResult | null>((resolve, reject) => {
+                     const { onceDone, isSettled, cleanup } = createPendingCallResolver(
+                        toolCallId,
+                        options,
+                        false,
+                        true,
+                        resolve,
+                        signal,
+                        timeout,
+                     );
+
+                     if (isSettled()) return;
+
+                     void Promise.resolve(
+                        ctx.ui.input(prompt, "Type your answer...", timeout ? { timeout } : undefined),
+                     )
+                        .then((answer) => {
+                           onceDone(createFreeformResponse(answer));
+                        })
+                        .catch((error) => {
+                           if (isSettled()) return;
+                           cleanup();
+                           reject(error);
+                        });
+                  });
+               }
+            } catch (error) {
+               const message =
+                  error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error);
+               return {
+                  content: [{ type: "text", text: `Ask tool failed: ${message}` }],
+                  isError: true,
+                  details: { error: message },
+               };
+            } finally {
+               removeOverlayInputListener?.();
+            }
 
             if (!response) {
+               pi.events.emit("ask:cancelled", { question, context: normalizedContext, options });
                return {
                   content: [{ type: "text", text: "User cancelled the question" }],
                   details: { question, context: normalizedContext, options, response: null, cancelled: true } as AskToolDetails,
@@ -1622,17 +1877,20 @@ export default function(pi: ExtensionAPI) {
          let result: AskUIResult | null;
          let overlayHandle: OverlayHandle | undefined;
          let removeOverlayInputListener: (() => void) | undefined;
+         let cleanupPendingCustomCall: (() => void) | undefined;
          let hasAnnouncedHide = false;
          try {
             const customFactory = (tui: TUI, theme: Theme, keybindings: KeybindingsManager, done: (result: AskUIResult | null) => void) => {
-               if (signal) {
-                  const onAbort = () => done(null);
-                  signal.addEventListener("abort", onAbort, { once: true });
-               }
-
-               if (timeout && timeout > 0) {
-                  setTimeout(() => done(null), timeout);
-               }
+               const { onceDone, cleanup } = createPendingCallResolver(
+                  toolCallId,
+                  options,
+                  allowMultiple,
+                  allowFreeform,
+                  done,
+                  signal,
+                  timeout,
+               );
+               cleanupPendingCustomCall = cleanup;
 
                return new AskComponent(
                   question,
@@ -1646,7 +1904,7 @@ export default function(pi: ExtensionAPI) {
                   theme,
                   keybindings,
                   shortcuts,
-                  done,
+                  onceDone,
                );
             };
 
@@ -1672,12 +1930,18 @@ export default function(pi: ExtensionAPI) {
                });
             }
 
-            const customResult = await ctx.ui.custom<AskUIResult | null>(
-               customFactory,
-               buildCustomUIOptions(effectiveDisplayMode, (handle) => {
-                  overlayHandle = handle;
-               }),
-            );
+            let customResult: AskUIResult | null | undefined;
+            try {
+               customResult = await ctx.ui.custom<AskUIResult | null>(
+                  customFactory,
+                  buildCustomUIOptions(effectiveDisplayMode, (handle) => {
+                     overlayHandle = handle;
+                  }),
+               );
+            } finally {
+               cleanupPendingCustomCall?.();
+               cleanupPendingCustomCall = undefined;
+            }
 
             if (customResult !== undefined) {
                result = customResult;
